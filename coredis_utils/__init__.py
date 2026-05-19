@@ -19,7 +19,7 @@ from coredis.typing import KeyT
 P = ParamSpec("P")
 R = TypeVar("R")
 
-VERSION = __version__ = "0.1.0"
+VERSION = "0.1.0"
 LIMITER_SCRIPT = """
 local val = redis.call('incr', KEYS[1])
 if val == 1 then
@@ -27,6 +27,7 @@ if val == 1 then
 end
 return val
 """
+__version__ = VERSION
 
 
 def _limit(key: KeyT, period: int) -> CommandRequest[int]: ...
