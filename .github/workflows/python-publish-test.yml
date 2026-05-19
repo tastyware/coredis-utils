@@ -1,0 +1,26 @@
+name: Publish Python distribution to TestPyPI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+    - name: Build package
+      run: uv build
+    - name: Publish to TestPyPI
+      run: uv publish --publish-url https://test.pypi.org/legacy/
