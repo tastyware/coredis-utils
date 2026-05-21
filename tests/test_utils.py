@@ -6,6 +6,7 @@ from coredis import Redis
 from coredis._concurrency import gather
 
 from coredis_utils import CoredisUtils
+from coredis_utils.cache import CachedError
 
 pytestmark = pytest.mark.anyio
 
@@ -185,7 +186,7 @@ async def test_cache_errors_are_cached(redis: Redis[Any]):
 
     with pytest.raises(ValueError, match="nope"):
         await work()
-    with pytest.raises(ValueError, match="nope"):
+    with pytest.raises(CachedError, match="ValueError"):
         await work()
 
     assert calls == 1
@@ -209,7 +210,6 @@ async def test_cache_error_ttl_zero_disables(redis: Redis[Any]):
 
 
 async def test_cache_stampede_propagates_error(redis: Redis[Any]):
-    """When the leader raises, all concurrent followers see the same error."""
     utils = CoredisUtils(redis)
     calls = 0
 
@@ -224,12 +224,14 @@ async def test_cache_stampede_propagates_error(redis: Redis[Any]):
         try:
             await work()
             return "no error"
-        except ValueError as e:
-            return str(e)
+        except (ValueError, CachedError) as e:
+            return repr(e)
 
     results = await gather(*[attempt() for _ in range(1000)])
-    assert all(r == "kaboom" for r in results)
+    assert all("kaboom" in r for r in results)
     assert calls == 1
+    # now we should get a CachedError
+    assert "CachedError" in await attempt()
 
 
 async def test_cache_signing_round_trip(redis: Redis[Any]):
@@ -298,10 +300,63 @@ async def test_cache_error_ttl_expiry(redis: Redis[Any]):
 
     with pytest.raises(ValueError):
         await work()
-    with pytest.raises(ValueError):
-        await work()  # cached error
+    with pytest.raises(CachedError):
+        await work()
     assert calls == 1
     await sleep(1)
 
     assert await work() == 42  # error expired, retry succeeds
     assert calls == 2
+
+
+async def test_cache_exclude_arg(redis: Redis[Any]):
+    utils = CoredisUtils(redis)
+    calls = 0
+
+    @utils.cached(ttl=60, exclude={"session"})
+    async def work(x: int, session: str) -> int:
+        nonlocal calls
+        calls += 1
+        return x * 2
+
+    assert await work(5, session="abc") == 10
+    assert await work(5, session="xyz") == 10  # session ignored in key
+    assert calls == 1
+    assert await work(6, session="abc") == 12  # x changed → miss
+    assert calls == 2
+
+
+async def test_cache_key_fns(redis: Redis[Any]):
+    utils = CoredisUtils(redis)
+    calls = 0
+
+    @utils.cached(ttl=60, key_fns={"user": lambda u: u["id"]})
+    async def work(user: dict[str, Any]) -> int:
+        nonlocal calls
+        calls += 1
+        return user["id"] * 2
+
+    assert await work({"id": 1, "name": "alice"}) == 2
+    assert await work({"id": 1, "name": "bob"}) == 2  # same id, hit
+    assert calls == 1
+    assert await work({"id": 2, "name": "carol"}) == 4
+    assert calls == 2
+
+
+async def test_cache_invalidate(redis: Redis[Any]):
+    utils = CoredisUtils(redis)
+    calls = 0
+
+    @utils.cached(ttl=60)
+    async def work(x: int) -> int:
+        nonlocal calls
+        calls += 1
+        return x * 2
+
+    assert await work(1) == 2
+    assert await work(1) == 2
+    assert calls == 1
+    assert await work.invalidate(1)
+    assert await work(1) == 2
+    assert calls == 2
+    assert not await work.invalidate(99)
