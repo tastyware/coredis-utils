@@ -10,7 +10,7 @@ from coredis.typing import KeyT
 
 from coredis_utils.cache import CachedFunction, P, R
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LIMITER_SCRIPT = """
 local val = redis.call('incr', KEYS[1])
 if val == 1 then
@@ -44,7 +44,7 @@ class CoredisUtils(Generic[AnyStr]):
         client: Redis[bytes] | RedisCluster[bytes],
         *,
         prefix: str | None = ...,
-        ttl: timedelta | int | None = ...,
+        ttl: timedelta | int = ...,
         signing_secret: str | None = ...,
     ) -> None: ...
 
@@ -54,7 +54,7 @@ class CoredisUtils(Generic[AnyStr]):
         client: Redis[str] | RedisCluster[str],
         *,
         prefix: str | None = ...,
-        ttl: timedelta | int | None = ...,
+        ttl: timedelta | int = ...,
         signing_secret: str | None = ...,
     ) -> None: ...
 
@@ -63,7 +63,7 @@ class CoredisUtils(Generic[AnyStr]):
         client: Redis[Any] | RedisCluster[Any],
         *,
         prefix: str | None = "coredis-utils",
-        ttl: timedelta | int | None = 300,
+        ttl: timedelta | int = 300,
         signing_secret: str | None = None,
     ) -> None:
         # Redis connection
@@ -81,7 +81,7 @@ class CoredisUtils(Generic[AnyStr]):
         :param key: idempotency key to use
         :param ttl: how long to prevent duplicate runs, defaults to 1 minute
         """
-        ttl = ttl or self.ttl
+        ttl = ttl if ttl is not None else self.ttl
         return await self._client.set(
             f"{self.prefix}idempotent:{key}", 1, condition=PureToken.NX, ex=ttl
         )
@@ -108,10 +108,9 @@ class CoredisUtils(Generic[AnyStr]):
         self,
         *,
         ttl: timedelta | int | None = ...,
-        error_ttl: timedelta | int | None = ...,
-        exclude: set[str] | None = None,
-        key_fns: dict[str, Callable[[Any], Any]] | None = None,
-        lock_timeout: int = ...,
+        error_ttl: timedelta | int = ...,
+        exclude: set[str] | None = ...,
+        key_fns: dict[str, Callable[[Any], Any]] | None = ...,
     ) -> Callable[[Callable[P, Awaitable[R]]], CachedFunction[P, R]]: ...
 
     def cached(
@@ -119,14 +118,13 @@ class CoredisUtils(Generic[AnyStr]):
         fn: Callable[P, Awaitable[R]] | None = None,
         *,
         ttl: timedelta | int | None = None,
-        error_ttl: timedelta | int | None = 0,
+        error_ttl: timedelta | int = 0,
         exclude: set[str] | None = None,
         key_fns: dict[str, Callable[[Any], Any]] | None = None,
-        lock_timeout: int = 60,
     ) -> Any:
         """
-        Cache the function's results in Redis. Uses a lock to implement "singleflight",
-        protecting against thundering herds on both per-process and distributed levels.
+        Cache results in Redis. Uses TTL-based probabilistic early recomputation to
+        protect against thundering herds.
 
         Cache key is generated using a SHA256 hash of pickled arguments. Use `exclude`
         to exclude arguments from hashing or `key_fns` to modify which parts of an
@@ -138,7 +136,6 @@ class CoredisUtils(Generic[AnyStr]):
         :param error_ttl: duration to cache errors, defaults to 0 (disabled)
         :param exclude: argument names to exclude from cache key generation
         :param key_fns: mapping of argument name -> lambda to modify argument
-        :param lock_timeout: how long to wait for distributed lock before failing
         """
         ttl = ttl or self.ttl
 
@@ -151,7 +148,6 @@ class CoredisUtils(Generic[AnyStr]):
                 error_ttl=error_ttl,
                 exclude=exclude,
                 key_fns=key_fns,
-                lock_timeout=lock_timeout,
             )
 
         if fn is None:

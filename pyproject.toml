@@ -54,7 +54,7 @@ authors = [
     { name = "Graeme Holliday", email = "graeme@tastyware.dev" }
 ]
 dependencies = [
-    "coredis>=6.6.1",
+    "coredis>=6.7.0",
 ]
 dynamic = ["version"]
 
