@@ -10,7 +10,7 @@ from coredis.typing import KeyT
 
 from coredis_utils.cache import CachedFunction, P, R
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 LIMITER_SCRIPT = """
 local val = redis.call('incr', KEYS[1])
 if val == 1 then
@@ -132,7 +132,7 @@ class CoredisUtils(Generic[AnyStr]):
         be hashed or don't reliably hash to the same value (eg database sessions, HTTP
         clients, SQLAlchemy objects).
 
-        :param ttl: duration to cache results, defaults to `cache_ttl`
+        :param ttl: duration to cache results, defaults to `CoredisUtils.ttl`
         :param error_ttl: duration to cache errors, defaults to 0 (disabled)
         :param exclude: argument names to exclude from cache key generation
         :param key_fns: mapping of argument name -> lambda to modify argument

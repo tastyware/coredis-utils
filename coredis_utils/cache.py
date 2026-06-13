@@ -47,6 +47,8 @@ class CachedError(Exception):
 
 class CachedFunction(Generic[P, R]):
     __slots__ = (
+        "hits",
+        "misses",
         "_owner",
         "_client",
         "_fn",
@@ -72,6 +74,10 @@ class CachedFunction(Generic[P, R]):
         exclude: set[str] | None,
         key_fns: dict[str, Callable[[Any], Any]] | None,
     ) -> None:
+        #: number of cache hits
+        self.hits = 0
+        #: number of cache misses
+        self.misses = 0
         self._owner = owner
         self._client = client
         self._fn = fn
@@ -92,11 +98,11 @@ class CachedFunction(Generic[P, R]):
     def build_key(self, *args: P.args, **kwargs: P.kwargs) -> str:
         bound = self._sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        key_args = {
-            k: self._key_fns[k](v) if k in self._key_fns else v
+        key_args = tuple(
+            self._key_fns[k](v) if k in self._key_fns else v
             for k, v in bound.arguments.items()
             if k not in self._exclude
-        }
+        )
         canonical = pickle.dumps(key_args, protocol=pickle.HIGHEST_PROTOCOL)
         digest = sha256(canonical).hexdigest()[:16]
         return f"{self._owner.prefix}cache:{self._fn_name}:{digest}"
@@ -153,6 +159,7 @@ class CachedFunction(Generic[P, R]):
         key = self.build_key(*args, **kwargs)
         res = await self._try_read(key)
         if res and not self._should_refresh(res):
+            self.hits += 1
             return self._unwrap(res)
         # max one computation per process
         lock = self._locks.get(key)
@@ -163,7 +170,9 @@ class CachedFunction(Generic[P, R]):
         async with lock:
             latest = await self._try_read(key)
             if latest and latest.expiry > prior_expiry:
+                self.hits += 1
                 return self._unwrap(latest)
+            self.misses += 1
             try:
                 val = await self._fn(*args, **kwargs)
             except Exception as e:
