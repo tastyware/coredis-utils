@@ -1,3 +1,4 @@
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -49,8 +50,8 @@ async def test_idempotency_ttl(redis: Redis[Any]):
 async def test_rate_limiter(redis: Redis[Any]):
     utils = CoredisUtils(redis)
     for _ in range(5):
-        assert await utils.limit("limiter", 5, 1)  # 5/second
-    assert not await utils.limit("limiter", 5, 1)
+        assert await utils.limit("limiter", 5, timedelta(seconds=1))  # 5/second
+    assert not await utils.limit("limiter", 5, timedelta(seconds=1))
 
 
 async def test_rate_limiter_parallel(redis: Redis[Any]):
@@ -59,7 +60,7 @@ async def test_rate_limiter_parallel(redis: Redis[Any]):
 
     async def contend():
         nonlocal counter
-        if await utils.limit("limiter", 5, 1):
+        if await utils.limit("limiter", 5, timedelta(seconds=1)):
             counter += 1
 
     async with create_task_group() as tg:
@@ -71,10 +72,10 @@ async def test_rate_limiter_parallel(redis: Redis[Any]):
 async def test_rate_limiter_next_window(redis: Redis[Any]):
     utils = CoredisUtils(redis)
     for _ in range(5):
-        assert await utils.limit("limiter", 5, 1)  # 5/second
-    assert not await utils.limit("limiter", 5, 1)
+        assert await utils.limit("limiter", 5, timedelta(seconds=1))  # 5/second
+    assert not await utils.limit("limiter", 5, timedelta(seconds=1))
     await sleep(1)
-    assert await utils.limit("limiter", 5, 1)
+    assert await utils.limit("limiter", 5, timedelta(seconds=1))
 
 
 async def test_cache_hits_concurrent(redis: Redis[Any]):
@@ -90,6 +91,25 @@ async def test_cache_hits_concurrent(redis: Redis[Any]):
 
     results = await gather(*[do_work() for _ in range(1_000)])
     assert sum(results) == 22_000
+    assert counter == 1
+
+
+async def test_cache_stampede_across_workers(redis: Redis[Any]):
+    counter = 0
+
+    async def do_work() -> int:
+        nonlocal counter
+        # hold the lease while the other workers pile up on the distributed lock
+        await sleep(0.05)
+        counter += 1
+        return 22
+
+    # each worker is a separate CachedFunction, so they share no in-process lock and
+    # must dedupe through Redis; same qualname → same cache key
+    workers = [CoredisUtils(redis).cached(ttl=60)(do_work) for _ in range(1000)]
+
+    results = await gather(*[worker() for worker in workers])
+    assert all(r == 22 for r in results)
     assert counter == 1
 
 

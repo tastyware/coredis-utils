@@ -4,7 +4,6 @@ import hmac
 import inspect
 import pickle
 import random
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -13,8 +12,8 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Generic, ParamSpec, TypeVar
 from weakref import WeakValueDictionary
 
-from anyio import Lock
-from coredis import Redis, RedisCluster
+from anyio import Lock, sleep
+from coredis import PureToken, Redis, RedisCluster
 
 if TYPE_CHECKING:
     from coredis_utils import CoredisUtils
@@ -27,14 +26,12 @@ R = TypeVar("R")
 @dataclass(slots=True, frozen=True)
 class _Ok:
     value: Any
-    expiry: float
 
 
 @dataclass(slots=True, frozen=True)
 class _Err:
     type: str
     repr: str
-    expiry: float
 
 
 class CachedError(Exception):
@@ -145,33 +142,36 @@ class CachedFunction(Generic[P, R]):
             raise CachedError(f"Cached error {res.type}: {res.repr}")
         return res.value
 
-    def _should_refresh(self, res: _Ok | _Err) -> bool:
-        remaining = res.expiry - time.time()
-        base_ttl = self._ttl if isinstance(res, _Ok) else self._error_ttl
-        window = base_ttl * 0.1  # last 10% of TTL
-        if remaining >= window:
-            return False
-        if remaining <= 0:
-            return True
-        return random.random() > (remaining / window)
-
     async def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         key = self.build_key(*args, **kwargs)
-        res = await self._try_read(key)
-        if res and not self._should_refresh(res):
+        if res := await self._try_read(key):
             self.hits += 1
             return self._unwrap(res)
-        # max one computation per process
+        # collapse the intra-process herd: many concurrent calls become one Redis waiter
         lock = self._locks.get(key)
         if lock is None:
-            lock = Lock()
-            self._locks[key] = lock
-        prior_expiry = res.expiry if res else 0
+            lock = self._locks[key] = Lock()
         async with lock:
-            latest = await self._try_read(key)
-            if latest and latest.expiry > prior_expiry:
+            # acquired per-process lock, recheck
+            if res := await self._try_read(key):
                 self.hits += 1
-                return self._unwrap(latest)
+                return self._unwrap(res)
+            # elect a single worker across the fleet to compute
+            lock_key, backoff = f"{key}:lock", 0.05
+            while not await self._client.set(
+                lock_key, 1, condition=PureToken.NX, ex=10
+            ):
+                # backoff with jitter so waiters don't retry simultaneously
+                await sleep(random.uniform(0, backoff))
+                if res := await self._try_read(key):
+                    self.hits += 1
+                    return self._unwrap(res)
+                backoff = min(backoff * 2, 1)
+            # acquired per-worker lock, recheck
+            if res := await self._try_read(key):
+                self.hits += 1
+                return self._unwrap(res)
+            # winner computes once on behalf of every waiter
             self.misses += 1
             try:
                 val = await self._fn(*args, **kwargs)
@@ -180,12 +180,15 @@ class CachedFunction(Generic[P, R]):
                     res = _Err(
                         type=f"{type(e).__module__}.{type(e).__qualname__}",
                         repr=repr(e),
-                        expiry=time.time() + self._error_ttl,
                     )
-                    await self._client.set(
-                        key, self._serialize(res), ex=self._error_ttl
-                    )
+                    async with self._client.pipeline(transaction=False) as pipe:
+                        pipe.set(key, self._serialize(res), ex=self._error_ttl)
+                        pipe.delete([lock_key])
+                else:
+                    await self._client.delete([lock_key])
                 raise
-            res = _Ok(value=val, expiry=time.time() + self._ttl)
-            await self._client.set(key, self._serialize(res), ex=self._ttl)
+            res = _Ok(value=val)
+            async with self._client.pipeline(transaction=False) as pipe:
+                pipe.set(key, self._serialize(res), ex=self._ttl)
+                pipe.delete([lock_key])
             return val

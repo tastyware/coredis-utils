@@ -5,23 +5,11 @@ from datetime import timedelta
 from typing import Any, AnyStr, Generic, overload
 
 from coredis import PureToken, Redis, RedisCluster
-from coredis.commands import CommandRequest
-from coredis.typing import KeyT
 
 from coredis_utils.cache import CachedFunction, P, R
 
-VERSION = "0.4.0"
-LIMITER_SCRIPT = """
-local val = redis.call('incr', KEYS[1])
-if val == 1 then
-  redis.call('expire', KEYS[1], ARGV[1])
-end
-return val
-"""
+VERSION = "0.5.0"
 __version__ = VERSION
-
-
-def _limit(key: KeyT, period: int) -> CommandRequest[int]: ...
 
 
 class CoredisUtils(Generic[AnyStr]):
@@ -36,7 +24,7 @@ class CoredisUtils(Generic[AnyStr]):
         serialization uses pickle. To generate a key, try: `secrets.token_urlsafe(32)`
     """
 
-    __slots__ = ("_client", "_limit", "prefix", "signing_secret", "ttl")
+    __slots__ = ("_client", "prefix", "signing_secret", "ttl")
 
     @overload
     def __init__(
@@ -71,8 +59,6 @@ class CoredisUtils(Generic[AnyStr]):
         self.prefix = prefix + ":" if prefix else ""
         self.ttl = ttl
         self.signing_secret = signing_secret.encode() if signing_secret else None
-        # coredis FFI stubs for Lua script
-        self._limit = client.register_script(LIMITER_SCRIPT).wraps()(_limit)
 
     async def idempotent(self, key: str, ttl: timedelta | int | None = 60) -> bool:
         """
@@ -86,19 +72,19 @@ class CoredisUtils(Generic[AnyStr]):
             f"{self.prefix}idempotent:{key}", 1, condition=PureToken.NX, ex=ttl
         )
 
-    async def limit(self, key: str, limit: int, period: timedelta | int) -> bool:
+    async def limit(self, key: str, limit: int, period: timedelta) -> bool:
         """
         Limits the number of successful calls per period to the given number using a
-        fixed-window rate limiting algorithm.
+        fixed-window rate limiting algorithm. Requires INCREX from Redis >= 8.8.0.
 
         :param key: unique identifier, usually some combination of user/IP/route
         :param limit: maximum number of calls that can succeed per period
         :param period: duration of window before more calls can succeed
         """
-        if isinstance(period, timedelta):
-            period = round(period.total_seconds())
-        count = await self._limit(f"{self.prefix}limit:{key}", period)
-        return count <= limit
+        _, remaining = await self._client.increx(
+            f"{self.prefix}limit:{key}", upperbound=limit, ex=period, enx=True
+        )
+        return bool(remaining)
 
     @overload
     def cached(self, fn: Callable[P, Awaitable[R]], /) -> CachedFunction[P, R]: ...
@@ -123,8 +109,8 @@ class CoredisUtils(Generic[AnyStr]):
         key_fns: dict[str, Callable[[Any], Any]] | None = None,
     ) -> Any:
         """
-        Cache results in Redis. Uses TTL-based probabilistic early recomputation to
-        protect against thundering herds.
+        Cache results in Redis with both per-process and per-worker thundering herd
+        protection on cache miss.
 
         Cache key is generated using a SHA256 hash of pickled arguments. Use `exclude`
         to exclude arguments from hashing or `key_fns` to modify which parts of an
