@@ -47,8 +47,10 @@ if await utils.idempotent("my-key", ttl=60):
 Rate limiting is similar:
 
 ```python
+from datetime import timedelta
+
 for _ in range(10):
-    if await utils.limit("my-ip-addr", 5, 1):  # limit to 5/second
+    if await utils.limit("my-ip-addr", 5, timedelta(seconds=1)):  # limit to 5/second
         print("success")
 ```
 
